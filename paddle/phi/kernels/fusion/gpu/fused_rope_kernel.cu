@@ -44,6 +44,7 @@ void FusedRopeKernel(const Context& dev_ctx,
   auto seq_len = q.dims()[1];
   auto num_heads = q.dims()[2];
   auto head_dim = q.dims()[3];
+  std::cout << batch_size << "," << seq_len << "," << num_heads << "," << head_dim << std::endl;
   PADDLE_ENFORCE_EQ(head_dim % 2,
                     0,
                     phi::errors::InvalidArgument(
@@ -51,11 +52,33 @@ void FusedRopeKernel(const Context& dev_ctx,
 
   constexpr const int vec_size = 2;
 
+#ifdef __MUSACC__
+  const int head_dim_vec = head_dim / vec_size;
+  // version 1
+  // bach_size = blockIdx.z
+  // seq_len = threadIdx.x + blockIdx.x * blockDim.x
+  // num_head = threadIdx.y + blockIdx.y * blockDim.y
+  // head_dim = threadIdx.z
+  /* dim3 block(1, 8, head_dim_vec); */
+  /* dim3 grid(seq_len, 64 / 8, batch_size); */
+
+  // version 2
+  // batch_size = blockIdx.y
+  // seq_len = threadIdx.y + blockIdx.x * blockDim.y
+  // num_head = for loop
+  // head_dim = threadIdx.x
+  constexpr int tile_s = 16;
+  dim3 block(head_dim_vec, tile_s, 1);
+  dim3 grid((seq_len + tile_s - 1) / tile_s, batch_size, 1);
+  printf("%d %d %d\n", block.x, block.y, block.z);
+  printf("%d %d %d\n", grid.x, grid.y, grid.z);
+#else
   auto config =
       phi::backends::gpu::GetGpuLaunchConfig1D(dev_ctx, numel, vec_size);
-
   int64_t grid = config.block_per_grid.x;
   int64_t block = config.thread_per_block.x;
+#endif
+
   auto stream = dev_ctx.stream();
 
   phi::Array<T*, 3> outs_data;
@@ -68,6 +91,7 @@ void FusedRopeKernel(const Context& dev_ctx,
   int num_inputs = 0;
 
   if (k.get_ptr()) {
+    printf("k has value ######################################\n");
     dev_ctx.template Alloc<T>(out_k);
     ins_data[1] = k->data<T>();
     outs_data[1] = out_k->data<T>();
@@ -75,6 +99,7 @@ void FusedRopeKernel(const Context& dev_ctx,
   }
 
   if (v.get_ptr()) {
+    printf("v has value ######################################\n");
     dev_ctx.template Alloc<T>(out_v);
     ins_data[2] = v->data<T>();
     outs_data[2] = out_v->data<T>();
@@ -97,6 +122,10 @@ void FusedRopeKernel(const Context& dev_ctx,
 
     auto sin_dims = sin.get_ptr()->dims();
     int dims_size = sin_dims.size();
+    for (int i = 0; i < dims_size; ++i) {
+        std::cout << sin_dims[i] << ",";
+    }
+    std::cout << std::endl;
     PADDLE_ENFORCE_EQ(
         (dims_size == 2 || dims_size == 4),
         true,
@@ -181,6 +210,23 @@ void FusedRopeKernel(const Context& dev_ctx,
                                      num_inputs,
                                      div_c);
   } else {
+#ifdef __MUSACC__
+    /* printf("VectorizedFusedRopeWithRotateHalfKernelMusa\n"); */
+    /* VectorizedFusedRopeWithRotateHalfKernelMusa<T, MPType, vec_size> */
+    VectorizedFusedRopeWithRotateHalfKernelMusaV2<T, MPType, vec_size>
+        <<<grid, block, 0, stream>>>(ins_data,
+                                     sin_cos_data,
+                                     position_ids_data,
+                                     flag_sin_cos,
+                                     sign,
+                                     batch_size,
+                                     seq_len,
+                                     num_heads,
+                                     head_dim,
+                                     outs_data,
+                                     num_inputs,
+                                     div_c);
+#else
     VectorizedFusedRopeWithRotateHalfKernel<T, MPType, vec_size>
         <<<grid, block, 0, stream>>>(ins_data,
                                      sin_cos_data,
@@ -194,6 +240,7 @@ void FusedRopeKernel(const Context& dev_ctx,
                                      outs_data,
                                      num_inputs,
                                      div_c);
+#endif
   }
 }
 }  // namespace fusion
