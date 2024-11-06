@@ -14,6 +14,13 @@
 
 #pragma once
 
+#ifdef __MUSACC__
+#include <musa.h>
+#include <musa_fp16.h>
+
+typedef _Float16 v8f16_t __attribute__((vector_size(16)));
+#endif
+
 #include "paddle/phi/kernels/funcs/aligned_vector.h"
 
 namespace phi {
@@ -214,6 +221,98 @@ __global__ void VectorizedFusedRopeWithRotateHalfKernel(
     }
   }
 }
+
+#ifdef __MUSACC__
+// grid(s/TILE_S, b, 1)
+// block(d / (VLEN * 2), TILE_S, 1)
+template <int32_t VLEN, bool BWD = false>
+__global__ void fusedRopeInterleaved(
+    half *p_output,                // [b, s, h, d]
+    const half *p_input,           // [b, s, h, d]
+    const half *p_cos,      // [1, s, 1, d]
+    const half *p_sin,      // [1, s, 1, d]
+    const int64_t *p_position_ids,  // [b, s]
+    const int32_t b, const int32_t s, const int32_t h, const int32_t d,
+    const int64_t out_stride_b, const int64_t out_stride_s,
+    const int64_t out_stride_h, const int64_t in_stride_b,
+    const int64_t in_stride_s, const int64_t in_stride_h,
+    const int64_t pos_stride_b) {
+  int64_t position_id = blockIdx.x * blockDim.y + threadIdx.y;
+  int64_t sin_cos_seq_id = position_id;
+  if (position_id >= s) return;
+  if (p_position_ids != nullptr) {
+    sin_cos_seq_id = p_position_ids[blockIdx.y * pos_stride_b + position_id];
+  }
+
+  static_assert(VLEN >= 1 && VLEN <= 8 && ((VLEN & (VLEN - 1)) == 0), "");
+
+  v8f16_t reg_out_l;
+  v8f16_t reg_out_r;
+  v8f16_t reg_in_l;
+  v8f16_t reg_in_r;
+  v8f16_t reg_sin_l;
+  v8f16_t reg_cos_l;
+  v8f16_t reg_sin_r;
+  v8f16_t reg_cos_r;
+
+  const int32_t half_d = d >> 1;
+
+  int64_t offset_sin_cos_l = sin_cos_seq_id * d + threadIdx.x * VLEN;
+  auto ptr_cos = p_cos + offset_sin_cos_l;
+  auto ptr_sin = p_sin + offset_sin_cos_l;
+
+
+  // reg_cos_l = *(v8f16_t *)(ptr_cos);
+  // reg_cos_r = *(v8f16_t *)(ptr_cos + half_d);
+  // reg_sin_l = *(v8f16_t *)(ptr_sin);
+  // reg_sin_r = *(v8f16_t *)(ptr_sin + half_d);
+  asm volatile(
+    "DMA.LD.B128 %0, %4, _  \n\t"
+    "DMA.LD.B128 %1, %5, _  \n\t"
+    "DMA.LD.B128 %2, %4, %6 \n\t"
+    "DMA.LD.B128 %3, %5, %6  "
+    : "=&R"(reg_cos_l), "=&R"(reg_sin_l), "=&R"(reg_cos_r), "=R"(reg_sin_r)
+    : "R"(ptr_cos), "R"(ptr_sin), "R"(d)
+  );
+
+  int64_t offset_in_l = blockIdx.y * in_stride_b + position_id * in_stride_s + threadIdx.x * VLEN;
+  int64_t offset_out_l = blockIdx.y * out_stride_b + position_id * out_stride_s + threadIdx.x * VLEN;
+  auto ptr_in = p_input + offset_in_l;
+  auto ptr_out = p_output + offset_out_l;
+#pragma unroll 1
+  for (int32_t head_j = 0; head_j < h; head_j ++) {
+    // reg_in_l = *(v8f16_t *)(ptr_in);
+    // reg_in_r = *(v8f16_t *)(ptr_in + half_d);
+    asm volatile(
+      "DMA.LD.B128 %0, %2, _  \n\t"
+      "DMA.LD.B128 %1, %2, %3 "
+      : "=&R"(reg_in_l), "=R"(reg_in_r)
+      : "R"(ptr_in), "R"((int32_t)(d))
+    );
+    
+#pragma unroll
+    for (int32_t vlen_k = 0; vlen_k < VLEN; ++vlen_k) {
+      if constexpr(BWD == false) {
+        reg_out_l[vlen_k] = float(reg_in_l[vlen_k]) * float(reg_cos_l[vlen_k]) -
+                            float(reg_in_r[vlen_k]) * float(reg_sin_l[vlen_k]);
+        reg_out_r[vlen_k] = float(reg_in_r[vlen_k]) * float(reg_cos_r[vlen_k]) +
+                            float(reg_in_l[vlen_k]) * float(reg_sin_r[vlen_k]);
+      } else {
+        reg_out_l[vlen_k] = float(reg_in_l[vlen_k] * reg_cos_l[vlen_k]) +
+                            float(reg_in_r[vlen_k] * reg_sin_l[vlen_k]);
+        reg_out_r[vlen_k] = float(reg_in_r[vlen_k]) * float(reg_cos_r[vlen_k]) -
+                            float(reg_in_l[vlen_k]) * float(reg_sin_r[vlen_k]);
+      }
+    }
+
+    *(v8f16_t *)(ptr_out) = reg_out_l;
+    *(v8f16_t *)(ptr_out + half_d) = reg_out_r;
+
+    ptr_in += in_stride_h;
+    ptr_out += out_stride_h;
+  }
+}
+#endif
 
 }  // namespace fusion
 }  // namespace phi

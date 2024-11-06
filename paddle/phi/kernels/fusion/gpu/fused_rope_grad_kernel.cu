@@ -111,6 +111,62 @@ void FusedRopeGradKernel(const Context& dev_ctx,
                                      num_inputs,
                                      div_c);
   } else {
+#ifdef __MUSACC__
+  int32_t musa_batch_size[3] = {0};
+  int32_t musa_seq_len[3] = {0};
+  int32_t musa_num_heads[3] = {0};
+  int32_t musa_head_dim[3] = {0};
+  musa_batch_size[0] = dout_q.dims()[0];
+  musa_seq_len[0] = dout_q.dims()[1];
+  musa_num_heads[0] = dout_q.dims()[2];
+  musa_head_dim[0] = dout_q.dims()[3];
+  if(dout_k.get_ptr()) {
+    musa_batch_size[1] = dout_k->dims()[0];
+    musa_num_heads[1] = dout_k->dims()[2];
+    musa_seq_len[1] = dout_k->dims()[1];
+    musa_head_dim[1] = dout_k->dims()[3];
+  }
+  if(dout_v.get_ptr()) {
+    musa_batch_size[2] = dout_v->dims()[0];
+    musa_num_heads[2] = dout_v->dims()[2];
+    musa_seq_len[2] = dout_v->dims()[1];
+    musa_head_dim[2] = dout_v->dims()[3];
+  }
+  if(flag_sin_cos && (std::is_same<T, float16>::value || std::is_same<T, half>::value) && musa_head_dim[0]%16 == 0 && musa_head_dim[1]%16 == 0 && musa_head_dim[2]%16 == 0) {
+    const int32_t v_len = 8;
+
+    for(int i = 0;i <= num_inputs; i++) {
+      const int32_t block_dim_x = musa_head_dim[i] / (2*v_len);
+      const int32_t tile_s = (512 + block_dim_x - 1) / block_dim_x;
+      
+      half *musa_input_data = (half *)ins_data[i];
+      half *musa_output_data = (half *)outs_data[i];
+      half *sin_data = (half *)sin_cos_data[0];
+      half *cos_data =  (half *)sin_cos_data[1];
+      const int64_t in_stride_b = musa_seq_len[i] * musa_num_heads[i] * musa_head_dim[i];
+      const int64_t in_stride_s = musa_num_heads[i] * musa_head_dim[i];
+      const int64_t in_stride_h = musa_head_dim[i];
+      const int64_t pos_stride_b = musa_seq_len[i];
+
+      dim3 musa_block(block_dim_x, tile_s, 1);
+      dim3 musa_grid((musa_seq_len[i]+tile_s-1)/tile_s, musa_batch_size[i], 1);
+      
+      fusedRopeInterleaved<8, true>
+            <<<musa_grid, musa_block, 0, stream>>>(musa_output_data,
+                                                   musa_input_data, 
+                                                   cos_data, 
+                                                   sin_data, 
+                                                   position_ids_data, 
+                                                   musa_batch_size[i],
+                                                   musa_seq_len[i],
+                                                   musa_num_heads[i], 
+                                                   musa_head_dim[i], 
+                                                   in_stride_b, in_stride_s, in_stride_h, 
+                                                   in_stride_b, in_stride_s, in_stride_h, 
+                                                   pos_stride_b);
+    }
+  } else {
+#endif
     VectorizedFusedRopeWithRotateHalfKernel<T, MPType, vec_size>
         <<<grid, block, 0, stream>>>(ins_data,
                                      sin_cos_data,
@@ -124,6 +180,9 @@ void FusedRopeGradKernel(const Context& dev_ctx,
                                      outs_data,
                                      num_inputs,
                                      div_c);
+#ifdef __MUSACC__
+  }
+#endif
   }
 }
 

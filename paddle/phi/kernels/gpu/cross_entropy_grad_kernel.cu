@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License. */
 
 #include "paddle/phi/kernels/cross_entropy_grad_kernel.h"
+#include <iostream>
 
 #if defined(__NVCC__) || defined(__MUSACC__)
 #include "cub/cub.cuh"
@@ -33,7 +34,9 @@ namespace cub = hipcub;
 #include "paddle/phi/kernels/funcs/math_function.h"
 #include "paddle/phi/kernels/funcs/softmax.h"
 #include "paddle/phi/kernels/gpudnn/softmax_gpudnn.h"
-
+#include <musa.h>
+#include <musa_robust.h>
+typedef float v4f32_t __attribute__((vector_size(16)));
 namespace phi {
 
 template <typename T>
@@ -138,6 +141,47 @@ __global__ void SoftmaxWithCrossEntropyGradHardLabel(T* logits_grad,
   }
 }
 
+/* 
+constraints: 
+1. d=1
+2. dim %4 ==0
+*/ 
+template <typename T, typename LabelT>
+__global__ void SoftmaxWithCrossEntropyGradHardLabel_new(T* logits_grad,
+                                                     const T* loss_grad,
+                                                     const T* softmax,
+                                                     const LabelT* labels,
+                                                     const int64_t n,
+                                                     const int64_t dim,
+                                                     const int64_t d,
+                                                     const int ignore_index) {
+    int row = blockDim.y * blockIdx.y + threadIdx.y;
+    int col = blockDim.x * blockIdx.x + threadIdx.x;
+    int label_row;
+    float loss_grad_row;
+    v4f32_t softmax_tid;
+    v4f32_t logits_tid = {0};
+    loss_grad_row = loss_grad[row];
+    label_row = labels[row];
+    int col_shl_2 = col << 2;
+    int offset = (row * dim) + col_shl_2;
+    softmax_tid = *((v4f32_t *)(&softmax[offset]));
+
+    if (col_shl_2 < dim && label_row != ignore_index){
+        #pragma unroll
+        for(int i = 0; i < 4; i++){
+            if ( 4 * col + i == label_row){
+                logits_tid[i] = (softmax_tid[i] - static_cast<T>(1.0)) * loss_grad_row;
+            } else {
+                logits_tid[i] = softmax_tid[i] * loss_grad_row;
+            }
+        }
+    }
+    if (col_shl_2 < dim) {
+        *((v4f32_t *)(&logits_grad[offset])) = logits_tid;
+    }
+}
+
 template <typename T, typename LabelT>
 void CrossEntropyWithSoftmaxGradGPUKernel(const GPUContext& dev_ctx,
                                           const DenseTensor& label,
@@ -218,6 +262,29 @@ void CrossEntropyWithSoftmaxGradGPUKernel(const GPUContext& dev_ctx,
     const T* softmax_data = softmax.data<T>();
     const auto* label_data = label.data<LabelT>();
     int grid = (n * d + block - 1) / block;
+    if constexpr(std::is_same<T, float>::value) {
+      if (remain == 1 && d == 32000 && (n == 2048 || n == 4096)) {
+        int tile_dim = 16;
+        int tile_n = 32;
+        int ld_count = 1;
+        uint block_xdim = tile_dim / ld_count / 4;
+        uint block_ydim = tile_n;
+        uint grid_xdim = (d + tile_dim - 1) / tile_dim;
+        uint grid_ydim = n / tile_n;
+        dim3 gridsize = {grid_xdim, grid_ydim, 1};
+        dim3 blocksize = {block_xdim, block_ydim, 1};
+        SoftmaxWithCrossEntropyGradHardLabel_new<float, LabelT>
+            <<<gridsize, blocksize, 0, stream>>>(logit_grad_data,
+                                                 loss_grad_data,
+                                                 softmax_data,
+                                                 label_data,
+                                                 n,
+                                                 d,
+                                                 remain,
+                                                 ignore_index);
+        return;
+      }
+    }
     SoftmaxWithCrossEntropyGradHardLabel<T>
         <<<grid, block, 0, stream>>>(logit_grad_data,
                                      loss_grad_data,
