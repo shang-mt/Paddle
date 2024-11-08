@@ -298,10 +298,10 @@ __global__ void fusedRopeInterleaved(
         reg_out_r[vlen_k] = float(reg_in_r[vlen_k]) * float(reg_cos_r[vlen_k]) +
                             float(reg_in_l[vlen_k]) * float(reg_sin_r[vlen_k]);
       } else {
-        reg_out_l[vlen_k] = float(reg_in_l[vlen_k] * reg_cos_l[vlen_k]) +
-                            float(reg_in_r[vlen_k] * reg_sin_l[vlen_k]);
+        reg_out_l[vlen_k] = float(reg_in_l[vlen_k]) * float(reg_cos_l[vlen_k]) +
+                            float(reg_in_r[vlen_k]) * float(reg_sin_r[vlen_k]);
         reg_out_r[vlen_k] = float(reg_in_r[vlen_k]) * float(reg_cos_r[vlen_k]) -
-                            float(reg_in_l[vlen_k]) * float(reg_sin_r[vlen_k]);
+                            float(reg_in_l[vlen_k]) * float(reg_sin_l[vlen_k]);
       }
     }
 
